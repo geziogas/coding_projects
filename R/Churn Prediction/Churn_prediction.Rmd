@@ -1,0 +1,583 @@
+---
+title: "Churn prediction problem"
+author: "George Ziogas"
+date: "1/23/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r, echo=FALSE, warning=FALSE, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(party)
+library(caret)
+library(gridExtra)
+library(rpart)
+library(rpart.plot)
+library(ROCR)
+library(randomForest)
+```
+
+# Churn Prediction Case 
+
+## Data Pre-processing 
+
+### Load data 
+The data-set was sent by email.  
+Format txt, tab delimited with 167 columns.  
+
+Steps we perform at that step:
+* Load data with the appropriate encoding UTF-8. 
+* Rename the columns to make them more clear and easily accessible (Janitor package)
+* Use Janitor package to clean the names as they contain non convenient characters
+* Inspect a sample
+
+```{r}
+filename = "C:\\Git_repository\\coding_projects\\R\\Churn Prediction\\LCI_Data_Set.txt"
+df <- read.table(filename, sep = '\t', header = TRUE, encoding = "UTF-8")
+df %>% clean_names() -> df
+```
+
+#### Data-set sample  
+
+```{r}
+df %>% head(10)
+```
+
+#### Summary of dataset
+
+```{r, echo=FALSE}
+df %>% summary()
+```
+
+
+### Check balance of dataset (Imbalanced)  
+It is important to understand if our dataset is imbalanced or not,  
+so that we know how to handle the different statistical metrics.
+
+```{r}
+df %>% group_by(target_alla) %>% summarise(count = n())
+```
+
+
+### Feature selection 
+As an important part of the preprocessing task, is to analyse the different features of the dataset  
+and perform various operations, as removing rows or columns or remap NA values, etc.  
+
+### Keep customers that are in the system for the full period 201501-201611   
+
+Smaller period would probably indicate missing values in some features, hence it's a good strategy to keep the  
+ones that existed during the full period (~37k remaining after cleaning at this point)  
+
+### Irrelevant columns, drop  
+
+Some columns are redundant or not useful and so we can remove them:  
+* Status_L, 
+* Status_A, 
+* DeceasedDate_Max, (remove deceased customers as we already know that these are churned)
+* customer_status_max (Always same value except 2 rows). Doesn't seem to impact the results - NA's:30971 
+* avslutsdatum_max (latest date that the customer terminated an agreement, considered churned, it's redundant so we can remove it)
+
+### Columns with a lot of NAs for all periods (~ 19.000 in all Hxx), which makes most of these features useless. 
+* marknadsvarde_sum. 
+* antal_kop_sum, 
+* antal_salj_sum, 
+* senaste_radgivning_ar_man
+
+```{r}
+df %>% filter(kundperiod_min == "201501", kundperiod_max == "201611") %>% 
+  mutate(deceased = case_when(deceased_date_max == "" ~ 0,
+                              TRUE ~ 1)
+        # ,kundperiod_days = as.numeric(ymd(kundperiod_max, truncated = 2L) - ymd(kundperiod_min, truncated = 2L))
+        ) %>% 
+  filter(deceased == 0) %>% 
+  select(-c(kundnr, kundperiod_min, kundperiod_max, status_l, status_a, deceased_date_max, avslutsdatum_max, customer_status_max, deceased)) %>% 
+  select(-c(h00_marknadsvarde_sum, h01_marknadsvarde_sum, h03_marknadsvarde_sum, h06_marknadsvarde_sum, h12_marknadsvarde_sum,
+            h00_antal_kop_sum, h01_antal_kop_sum, h03_antal_kop_sum, h06_antal_kop_sum, h12_antal_kop_sum,
+            h00_antal_salj_sum, h01_antal_salj_sum, h03_antal_salj_sum, h06_antal_salj_sum, h12_antal_salj_sum,
+            h00_senaste_radgivning_ar_man,h01_senaste_radgivning_ar_man,h03_senaste_radgivning_ar_man,h06_senaste_radgivning_ar_man,
+            h12_senaste_radgivning_ar_man)) -> df_1
+```
+
+### Chunk to check for NAs
+A lot of missing values for H12 of VPKBA system  
+Let's see what's happening if we try to remove them  
+
+```{r}
+sapply(df_1, function(x) sum(is.na(x)))
+```
+### Removing VKPBA H12 features 
+We notice a periodice appearance of NA values for all VKBPA columns.  
+Let's remove one of the H12 columns and check the remainings.  
+
+After the removal of H12 NA rows we see the following:   
+* We almost eliminated completely the NA values. 3 Rows with NAs remaining that we can drop.
+* Most of the removed rows were from the un-churned customers. 
+Churned were not affected a lot.
+
+```{r}
+df_1 %>% drop_na(h12_over_under_varde_sum) -> df_1_clean_h12_vpkba
+df_1_clean_h12_vpkba %>% group_by(target_alla) %>% summarise(count = n())
+df_1_clean_h12_vpkba %>% drop_na() -> df_2
+```
+
+### CHeck for other NA values  
+All columns seem to be clean from NA values  
+
+```{r}
+sapply(df_2, function(x) sum(is.na(x)))
+```
+
+### Separate the features into VPKBA and CAT features.  
+This separation will help us later.  
+
+```{r}
+columns <- df_2 %>% colnames %>% data.frame(stringsAsFactors = FALSE)
+colnames(columns) <- c("column_name")
+columns %>% slice(100:139) -> VPKBA_columns
+columns %>% slice(5:99) -> CAT_columns
+```
+
+### Clean and re-calculate VKBPA columns  
+
+* Calculate the average
+* Remove the middle periods (HH01,03,06) columns
+** By removing these, we basically keep the information that shows us the "entry" amounts and the "exit" amounts, which seem more important
+
+```{r}
+df_2 %>% mutate(fast_avg_sum_avg = rowMeans(select(., h00_fast_avg_sum, h01_fast_avg_sum, h03_fast_avg_sum,
+                                                      h06_fast_avg_sum, h12_fast_avg_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_fast_avg_sum, h01_fast_avg_sum, h03_fast_avg_sum, 
+            #           h06_fast_avg_sum, h12_fast_avg_sum)) %>% 
+            select(-c(h01_fast_avg_sum, h03_fast_avg_sum, h06_fast_avg_sum)) %>% 
+            mutate(extra_avg_sum_avg = rowMeans(select(.,h00_extra_avg_sum, h01_extra_avg_sum, h03_extra_avg_sum,
+                                                      h06_extra_avg_sum, h12_extra_avg_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_extra_avg_sum, h01_extra_avg_sum, h03_extra_avg_sum, 
+            #           h06_extra_avg_sum, h12_extra_avg_sum)) %>% 
+            select(-c(h01_extra_avg_sum, h03_extra_avg_sum, h06_extra_avg_sum)) %>% 
+            mutate(antal_rorelser_sum_avg = rowMeans(select(., h00_antal_rorelser_sum, h01_antal_rorelser_sum, h03_antal_rorelser_sum,
+                                                          h06_antal_rorelser_sum, h12_antal_rorelser_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_antal_rorelser_sum, h01_antal_rorelser_sum, h03_antal_rorelser_sum,
+            #           h06_antal_rorelser_sum, h12_antal_rorelser_sum)) %>% 
+            select(-c(h01_antal_rorelser_sum, h03_antal_rorelser_sum, h06_antal_rorelser_sum)) %>% 
+            mutate(likvid_belopp_sum_avg = rowMeans(select(., h00_likvid_belopp_sum, h01_likvid_belopp_sum, h03_likvid_belopp_sum,
+                                                          h06_likvid_belopp_sum, h12_likvid_belopp_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_likvid_belopp_sum, h01_likvid_belopp_sum, h03_likvid_belopp_sum,
+            #           h06_likvid_belopp_sum, h12_likvid_belopp_sum)) %>% 
+            select(-c(h01_likvid_belopp_sum, h03_likvid_belopp_sum, h06_likvid_belopp_sum)) %>% 
+            mutate(belanings_varde_sum_avg = rowMeans(select(., h00_belanings_varde_sum, h01_belanings_varde_sum, h03_belanings_varde_sum,
+                                                          h06_belanings_varde_sum, h12_belanings_varde_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_belanings_varde_sum, h01_belanings_varde_sum, h03_belanings_varde_sum,
+            #           h06_belanings_varde_sum, h12_belanings_varde_sum)) %>% 
+            select(-c(h01_belanings_varde_sum, h03_belanings_varde_sum, h06_belanings_varde_sum)) %>% 
+            mutate(belopp_avkastn_konto_sum_avg = rowMeans(select(., h00_belopp_avkastn_konto_sum, h01_belopp_avkastn_konto_sum, h03_belopp_avkastn_konto_sum,
+                                                          h06_belopp_avkastn_konto_sum, h12_belopp_avkastn_konto_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_belopp_avkastn_konto_sum, h01_belopp_avkastn_konto_sum, h03_belopp_avkastn_konto_sum,
+            #           h06_belopp_avkastn_konto_sum, h12_belopp_avkastn_konto_sum)) %>% 
+            select(-c(h01_belopp_avkastn_konto_sum, h03_belopp_avkastn_konto_sum, h06_belopp_avkastn_konto_sum)) %>% 
+            mutate(belopp_likvid_konto_sum_avg = rowMeans(select(., h00_belopp_likvid_konto_sum, h01_belopp_likvid_konto_sum, h03_belopp_likvid_konto_sum,
+                                                          h06_belopp_likvid_konto_sum, h12_belopp_likvid_konto_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_belopp_likvid_konto_sum, h01_belopp_likvid_konto_sum, h03_belopp_likvid_konto_sum,
+            #           h06_belopp_likvid_konto_sum, h12_belopp_likvid_konto_sum)) %>% 
+            select(-c(h01_belopp_likvid_konto_sum, h03_belopp_likvid_konto_sum, h06_belopp_likvid_konto_sum)) %>% 
+            mutate(over_under_varde_sum_avg = rowMeans(select(., h00_over_under_varde_sum, h01_over_under_varde_sum, h03_over_under_varde_sum,
+                                                          h06_over_under_varde_sum, h12_over_under_varde_sum), na.rm = TRUE)) %>% 
+            # select(-c(h00_over_under_varde_sum, h01_over_under_varde_sum, h03_over_under_varde_sum,
+            #           h06_over_under_varde_sum, h12_over_under_varde_sum)) %>% 
+            select(-c(h01_over_under_varde_sum, h03_over_under_varde_sum, h06_over_under_varde_sum)) -> cleaned_VPKBA
+```
+
+### Process CAT columns cleaning (NOT USED. We leave it as it is)
+* Calculate the average, ignore NAs (there should be at least 1 Hxx period)
+* Remove the HH columns
+
+```{r, eval=FALSE, include = FALSE}
+cleaned_VPKBA %>% mutate(ant_inlogg_internetbank_man_avg = rowMeans(select(., h00_ant_inlogg_internetbank_man, h01_ant_inlogg_internetbank_man, 
+                                                          h03_ant_inlogg_internetbank_man, h06_ant_inlogg_internetbank_man, 
+                                                          h12_ant_inlogg_internetbank_man), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_inlogg_internetbank_man, h01_ant_inlogg_internetbank_man, h03_ant_inlogg_internetbank_man,
+                    h06_ant_inlogg_internetbank_man, h12_ant_inlogg_internetbank_man)) %>% 
+          mutate(ant_inlogg_mobilbank_pri_man_avg = rowMeans(select(., h00_ant_inlogg_mobilbank_pri_man, h01_ant_inlogg_mobilbank_pri_man,
+                                                          h03_ant_inlogg_mobilbank_pri_man, h06_ant_inlogg_mobilbank_pri_man,
+                                                          h12_ant_inlogg_mobilbank_pri_man), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_inlogg_mobilbank_pri_man, h01_ant_inlogg_mobilbank_pri_man, h03_ant_inlogg_mobilbank_pri_man,
+                    h06_ant_inlogg_mobilbank_pri_man, h12_ant_inlogg_mobilbank_pri_man)) %>% 
+          mutate(ant_inlogg_mobilbank_tab_man_avg = rowMeans(select(., h00_ant_inlogg_mobilbank_tab_man, h01_ant_inlogg_mobilbank_tab_man,
+                                                          h03_ant_inlogg_mobilbank_tab_man, h06_ant_inlogg_mobilbank_tab_man,
+                                                          h12_ant_inlogg_mobilbank_tab_man), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_inlogg_mobilbank_tab_man, h01_ant_inlogg_mobilbank_tab_man, h03_ant_inlogg_mobilbank_tab_man,
+                    h06_ant_inlogg_mobilbank_tab_man, h12_ant_inlogg_mobilbank_tab_man)) %>% 
+          mutate(ant_trans_telbank_sb_man_avg = rowMeans(select(., h00_ant_trans_telbank_sb_man, h01_ant_trans_telbank_sb_man,
+                                                          h03_ant_trans_telbank_sb_man, h06_ant_trans_telbank_sb_man,
+                                                          h12_ant_trans_telbank_sb_man), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_trans_telbank_sb_man, h01_ant_trans_telbank_sb_man, h03_ant_trans_telbank_sb_man,
+                    h06_ant_trans_telbank_sb_man, h12_ant_trans_telbank_sb_man)) %>% 
+          mutate(ant_uppring_telbank_ps_man_avg = rowMeans(select(., h00_ant_uppring_telbank_ps_man, h01_ant_uppring_telbank_ps_man,
+                                                          h03_ant_uppring_telbank_ps_man, h06_ant_uppring_telbank_ps_man,
+                                                          h12_ant_uppring_telbank_ps_man), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_uppring_telbank_ps_man, h01_ant_uppring_telbank_ps_man, h03_ant_uppring_telbank_ps_man,
+                    h06_ant_uppring_telbank_ps_man, h12_ant_uppring_telbank_ps_man)) %>% 
+          mutate(ant_produkter_betala_avg = rowMeans(select(., h00_ant_produkter_betala, h01_ant_produkter_betala,
+                                                          h03_ant_produkter_betala, h06_ant_produkter_betala,
+                                                          h12_ant_produkter_betala), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_produkter_betala, h01_ant_produkter_betala, h03_ant_produkter_betala,
+                    h06_ant_produkter_betala, h12_ant_produkter_betala)) %>% 
+          mutate(ant_produkter_lana_avg = rowMeans(select(., h00_ant_produkter_lana, h01_ant_produkter_lana,
+                                                          h03_ant_produkter_lana, h06_ant_produkter_lana,
+                                                          h12_ant_produkter_lana), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_produkter_lana, h01_ant_produkter_lana, h03_ant_produkter_lana, 
+                    h06_ant_produkter_lana, h12_ant_produkter_lana)) %>% 
+          mutate(ant_produkter_spara_avg = rowMeans(select(., h00_ant_produkter_spara, h01_ant_produkter_spara,
+                                                          h03_ant_produkter_spara, h06_ant_produkter_spara,
+                                                          h12_ant_produkter_spara), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_produkter_spara, h01_ant_produkter_spara, h03_ant_produkter_spara,
+                    h06_ant_produkter_spara, h12_ant_produkter_spara)) %>% 
+          mutate(ant_produkter_totalt_avg = rowMeans(select(., h00_ant_produkter_totalt, h01_ant_produkter_totalt,
+                                                          h03_ant_produkter_totalt, h06_ant_produkter_totalt,
+                                                          h12_ant_produkter_totalt), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_produkter_totalt, h01_ant_produkter_totalt, h03_ant_produkter_totalt,
+                    h06_ant_produkter_totalt, h12_ant_produkter_totalt)) %>% 
+          mutate(ant_produkter_ovrigt_avg = rowMeans(select(., h00_ant_produkter_ovrigt, h01_ant_produkter_ovrigt,
+                                                          h03_ant_produkter_ovrigt, h06_ant_produkter_ovrigt,
+                                                          h12_ant_produkter_ovrigt), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_produkter_ovrigt, h01_ant_produkter_ovrigt, h03_ant_produkter_ovrigt,
+                    h06_ant_produkter_ovrigt, h12_ant_produkter_ovrigt)) %>% 
+          mutate(ant_sakforsakringar_avg = rowMeans(select(., h00_ant_sakforsakringar, h01_ant_sakforsakringar,
+                                                          h03_ant_sakforsakringar, h06_ant_sakforsakringar,
+                                                          h12_ant_sakforsakringar), na.rm = TRUE)) %>% 
+          select(-c(h00_ant_sakforsakringar, h01_ant_sakforsakringar, h03_ant_sakforsakringar,
+                    h06_ant_sakforsakringar, h12_ant_sakforsakringar)) %>% 
+          mutate(har_kontaktperson_max = rowMeans(select(.,h01_har_kontaktperson, h03_har_kontaktperson, 
+                                                         h06_har_kontaktperson, h12_har_kontaktperson),na.rm = TRUE),
+                   har_kontaktperson_removed = case_when(
+                        har_kontaktperson_max > 0 & h00_har_kontaktperson == 0 ~ 1,
+                        TRUE ~ 0),
+                   har_kontaktperson_added = case_when(
+                        har_kontaktperson_max == 0 & h00_har_kontaktperson == 1 ~ 1,
+                        TRUE ~ 0)) %>% select(-c( har_kontaktperson_max,
+                                                  h01_har_kontaktperson,
+                                                  h03_har_kontaktperson,
+                                                  h06_har_kontaktperson,
+                                                  h12_har_kontaktperson)) %>% 
+          mutate(sa_hypotekslan_avg = rowMeans(select(., h00_sa_hypotekslan, h01_sa_hypotekslan, h03_sa_hypotekslan, 
+                                                      h06_sa_hypotekslan, h12_sa_hypotekslan), na.rm = TRUE)) %>% 
+          select(-c(h00_sa_hypotekslan, h01_sa_hypotekslan, h03_sa_hypotekslan,
+                    h06_sa_hypotekslan, h12_sa_hypotekslan)) %>% 
+          mutate(sa_inkomst_avg = rowMeans(select(., h00_sa_inkomst, h01_sa_inkomst,h03_sa_inkomst,
+                                                  h06_sa_inkomst, h12_sa_inkomst), na.rm = TRUE)) %>% 
+          select(-c(h00_sa_inkomst, h01_sa_inkomst, h03_sa_inkomst,
+                    h06_sa_inkomst, h12_sa_inkomst)) %>% 
+          mutate(sa_placeringsvolym_avg = rowMeans(select(., h00_sa_placeringsvolym, h01_sa_placeringsvolym, h03_sa_placeringsvolym, 
+                                                          h06_sa_placeringsvolym, h12_sa_placeringsvolym), na.rm = TRUE)) %>% 
+          select(-c(h00_sa_placeringsvolym, h01_sa_placeringsvolym, h03_sa_placeringsvolym,
+                    h06_sa_placeringsvolym, h12_sa_placeringsvolym)) %>% 
+          mutate(sa_total_utvolym_avg = rowMeans(select(., h00_sa_total_utvolym, h01_sa_total_utvolym, h03_sa_total_utvolym,
+                                                          h06_sa_total_utvolym, h12_sa_total_utvolym), na.rm = TRUE)) %>% 
+          select(-c(h00_sa_total_utvolym, h01_sa_total_utvolym, h03_sa_total_utvolym,
+                    h06_sa_total_utvolym, h12_sa_total_utvolym)) %>% 
+          mutate(sa_vardepapper_avg = rowMeans(select(., h00_sa_vardepapper, h01_sa_vardepapper, h03_sa_vardepapper, 
+                                                      h06_sa_vardepapper, h12_sa_vardepapper), na.rm = TRUE)) %>% 
+          select(-c(h00_sa_vardepapper, h01_sa_vardepapper, h03_sa_vardepapper,
+                    h06_sa_vardepapper, h12_sa_vardepapper)) %>% 
+          mutate(tb2_avg = rowMeans(select(., h00_tb2, h01_tb2, h03_tb2,
+                                           h06_tb2, h12_tb2), na.rm = TRUE)) %>% 
+          select(-c(h00_tb2, h01_tb2, h03_tb2, h06_tb2, h12_tb2)) -> cleaned_CAT
+```
+
+### Additional inspection of the Har_contact_person columns (NOT USED)
+
+We can clearly see here that the majority of people that either churn or not are the most stable,  
+i.e. the ones that haven't changed their contacts  
+(either had always, or never). Hence we can say that this parameter doesn't really affect the result.
+
+```{r, eval=FALSE, include=FALSE}
+# cleaned_CAT
+cleaned_VPKBA %>% group_by(target_alla, h00_har_kontaktperson, h01_har_kontaktperson, h03_har_kontaktperson) %>% 
+  summarise(c = n()) 
+```
+
+### Prepare the Final dataset
+
+After completely handling the NA values, we continue with: 
+* Remove label related columns, keep "ref_alla" as the label.
+
+```{r}
+# cleaned_CAT
+cleaned_VPKBA %>% select(-c(target_alla, target_delvis, target_helt)) -> final_df_pre
+# final_df$h00_har_kontaktperson[is.na(final_df$h00_har_kontaktperson)] <- 0
+# final_df %>% select(-c(h01_kundsegment, h03_kundsegment, h06_kundsegment, h12_kundsegment)) %>% drop_na() -> final_df
+# final_df %>% mutate(ref_alla = as.factor(ref_alla))  -> final_df_1
+# dummy_v  <- dummyVars(" ~ .", data = final_df)
+# final_df_2 <- data.frame(predict(dummy_v, newdata = final_df))
+final_df_pre %>% mutate(ref_alla = as.factor(ref_alla))  -> final_df
+```
+
+### Checking the frequency of all Customer segments
+
+```{r, fig.width=10, echo=FALSE}
+final_df %>% filter(ref_alla == 0) %>% ggplot() + geom_bar(aes(x=h00_kundsegment), position = "dodge") -> p1
+final_df %>% filter(ref_alla == 0) %>% ggplot() + geom_bar(aes(x=h01_kundsegment), position = "dodge") -> p2
+final_df %>% filter(ref_alla == 0) %>% ggplot() + geom_bar(aes(x=h03_kundsegment), position = "dodge") -> p3
+final_df %>% filter(ref_alla == 0) %>% ggplot() + geom_bar(aes(x=h06_kundsegment), position = "dodge") -> p4
+final_df %>% filter(ref_alla == 0) %>% ggplot() + geom_bar(aes(x=h12_kundsegment), position = "dodge") -> p5
+grid.arrange(p1,p2,p3,p4,p5, ncol=2)
+```
+
+### Split data-set
+  
+Split the final dataset into 80/20 training/testing sets
+
+```{r}
+intrain<- createDataPartition(final_df$ref_alla, p=0.8,list=FALSE)
+set.seed(1337)
+training<- final_df[intrain,]
+testing<- final_df[-intrain,]
+```
+
+## Predicting - Choosing the machine learning models  
+
+In this chapter we will try 3 different models  
+1. Logistic Regression Model  
+2. Decision Tree  
+3. Random Forest  
+
+As dependent variable (Label) we use the ref_alla, which indicates  
+* if customers have not closed any agreements (1)
+* if customers have closed at least agreement (0)
+
+0 will be our possitive value.
+
+### Logistic model
+
+#### Training 
+
+```{r}
+predmodel.log <- glm(ref_alla ~ . ,family=binomial(link="logit"), data=training)
+print(summary(predmodel.log))
+```
+
+#### Analysis of Variance method 
+  
+We use this statistical method for analysing the different importance of the features
+
+```{r, eval=FALSE}
+anova(predmodel.log, test="Chisq")
+```
+
+### ANOVA (Testing the feature importance)  
+
+1. h00_ant_produkter_spara
+2. h01_ant_produkter_betala
+3. h00_ant_produkter_betala
+4. h00_kundsegment
+5. h12_likvid_belopp_sum
+6. h00_ant_uppring_telbank_ps_man
+7. h00_ant_produkter_ovrigt
+8. h03_ant_produkter_spara
+9. h01_kundsegment
+10. h01_ant_produkter_lana
+
+### Feature importance of Logistic model (Caret Variable Importance function)  
+
+1. h00_ant_uppring_telbank_ps_man
+2. h12_likvid_belopp_sum
+3. h01_ant_produkter_spara
+4. h00_ant_produkter_totalt
+5. h00_tb2
+6. h00_likvid_belopp_sum
+7. likvid_belopp_sum_avg
+8. h00_ant_produkter_betala
+9. h00_ant_produkter_lana
+10. h00_sa_vardepapper
+
+#### Caret Variable importance 
+  
+Returns the sorted in descendant order of the variable importance 
+
+```{r}
+imp <- as.data.frame(varImp(predmodel.log))
+imp <- data.frame(overall = imp$Overall,
+           names   = rownames(imp))
+imp[order(imp$overall,decreasing = T),]
+```
+
+#### Prediction of test-set  
+
+We will perform the prediction of the labels (ref_alla)  
+Above 0.5 is considered 1, below is considered 0 (True or False)  
+
+(Confusion matrix)   
+We have to define which factor is positive.   
+positive = "0" because ref_alla = 0 means that the customer has closed at least one agreement  
+  
+Results:  
+* Sensitivity : 0.7129  
+* Pos Pred Value : 0.8901  
+* Accuracy : 0.928  
+* Balanced Accuracy : 0.8460  
+
+```{r}
+log.pred <- predict(predmodel.log, newdata = testing, type = 'response')
+log.pred_f <- as.factor(ifelse(log.pred > 0.5, 1, 0))
+log.result <- confusionMatrix(data = log.pred_f, testing$ref_alla, positive = "0")
+print(log.result)
+```
+
+#### ROC analysis (Receiver operating characteristic curve)
+  
+Here we can see the ratio of the TPR/FPR of the logistic model
+
+```{r,fig.width=8, fig.height=6}
+predicted <- prediction(log.pred, testing$ref_alla)
+prfce <- performance(predicted, measure = "tpr", x.measure = "fpr")
+plot(prfce)
+```
+
+### Decision Trees 
+
+We will use the following features (important from logistic) in the ctree model  
+1. h00_ant_uppring_telbank_ps_man
+2. h12_likvid_belopp_sum
+3. h01_ant_produkter_spara
+4. h00_tb2
+5. h00_ant_produkter_totalt
+6. h00_likvid_belopp_sum
+7. likvid_belopp_sum_avg
+8. h00_ant_produkter_betala
+9. h00_ant_produkter_lana
+10. h03_tb2
+  
+For 10 features the ctree performs (Sensitivity) worse than the logistic (0,71) and RF model (0,58)
+```{r}
+tree <- ctree(ref_alla ~ h00_ant_uppring_telbank_ps_man + h12_likvid_belopp_sum + h01_ant_produkter_spara 
+              + h00_tb2 + h00_ant_produkter_totalt + h00_likvid_belopp_sum + likvid_belopp_sum_avg
+              + h00_ant_produkter_betala + h00_ant_produkter_lana + h03_tb2, training)
+```
+
+#### Decision Tree Prediction performance
+  
+Results:  
+  
+* Sensitivity : 0.43537  
+* Pos Pred Value (Precision): 0.83030  
+* Accuracy : 0.8745  
+* Balanced Accuracy : 0.70675  
+  
+The sensitivity performs much worse than the Logistic model.
+
+```{r}
+pred_tree <- predict(tree, testing, type = "response")
+confusionMatrix(data = pred_tree, testing$ref_alla, positive = "0")
+```
+
+### RandomForest prediction performance
+  
+Results (For default 500 trees):  
+* Sensitivity (Recall): 0.5837  
+* Pos Pred Value (Precision): 0.9132  
+* Accuracy : 0.9095   
+* Balanced Accuracy : 0.7852  
+
+```{r}
+predmodel.rf = randomForest(ref_alla ~., data = training, importance = T)
+# predmodel.rf
+# churn.predict.prob <- predict(predmodel.rf, testing, type="prob")
+churn.predict <- predict(predmodel.rf, testing)
+confusionMatrix(churn.predict, testing$ref_alla, positive = "0")
+```
+
+#### Nr.Trees/Error
+
+```{r}
+plot(predmodel.rf)
+```
+
+#### Feature importance of RF model
+
+```{r}
+importance(predmodel.rf)
+```
+
+#### Plot importance ranking from RF model
+  
+1. h00_sa_placeringsvolym
+2. h00_ant_uppring_telbank_ps_man
+3. h12_tb2
+4. h00_kundsegment
+5. h12_sa_placeringsvolym
+6. belopp_avkastn_konto_sum_avg
+7. h00_ant_produkter_spara
+8. h00_over_under_varde_sum
+9. h12_over_under_varde_sum
+10. h00_belopp_avkastn_konto_sum
+
+```{r, fig.width=10}
+varImpPlot(predmodel.rf)
+```
+
+### Comparison of important features (That characterize the customers that churn)
+  
+#### Logistic model:  
+1. h00_ant_uppring_telbank_ps_man
+2. h12_likvid_belopp_sum
+3. h01_ant_produkter_spara
+4. h00_ant_produkter_totalt
+5. h00_tb2
+6. h00_likvid_belopp_sum
+7. likvid_belopp_sum_avg
+8. h00_ant_produkter_betala
+9. h00_ant_produkter_lana
+10. h00_sa_vardepapper
+
+#### RF model:
+1. h00_sa_placeringsvolym
+2. h00_ant_uppring_telbank_ps_man
+3. h12_tb2
+4. h00_kundsegment
+5. h12_sa_placeringsvolym
+6. belopp_avkastn_konto_sum_avg
+7. h00_ant_produkter_spara
+8. h00_over_under_varde_sum
+9. h12_over_under_varde_sum
+10. h00_belopp_avkastn_konto_sum
+
+
+
+### Try K Fold cross validation (k=10) for Logistic model
+  
+We will try this on the Logistic model to see we can further  
+  
+Results (Cross Validation):  
+* Sensitivity (Recall): 0.7193  
+* Pos Pred Value(Precision) : 0.9025  
+* Accuracy : 0.9312  
+* Balanced Accuracy : 0.8504  
+
+Results (Logistic):  
+* Sensitivity : 0.7129  
+* Pos Pred Value : 0.8901  
+* Accuracy : 0.928  
+* Balanced Accuracy : 0.8460  
+  
+Slightly better than the single run on Logistic model.  
+
+```{r}
+set.seed(1337)
+ctrl <- trainControl(method = "repeatedcv", number = 10, savePredictions = TRUE)
+mod_fit <- train(ref_alla ~ .,  data=final_df, method="glm", family="binomial",
+                 trControl = ctrl, tuneLength = 5)
+pred.crossval = predict(mod_fit, newdata=testing)
+```
+
+#### Confusion matrix for Cross Validation of Logistic model
+
+```{r}
+confusionMatrix(data=pred.crossval, testing$ref_alla)
+```
+
